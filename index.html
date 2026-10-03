@@ -2854,6 +2854,14 @@ function autoGenerateAll(){
     const currentCount = (classSubjectDayCount[a.classId][day]||{})[a.subjectId] || 0;
     if(currentCount>0 && currentCount<minPerDay) score -= 30;
     else if(currentCount===0) score += 10;
+    // Spread the subject over as many days as requested (ژمارەی ڕۆژان): a 2nd/3rd lesson of the
+    // same subject on one day is strongly discouraged, and so is opening more days than requested.
+    if(currentCount>=Math.max(1,minPerDay)) score += 400 * currentCount;
+    if(currentCount===0){
+      let usedDays = 0;
+      for(const dd of days){ if(((classSubjectDayCount[a.classId][dd]||{})[a.subjectId]||0)>0) usedDays++; }
+      if(usedDays >= (a.daysPerWeek || days.length)) score += 250;
+    }
 
     const teacher = teacherMap[a.teacherId];
     if(teacher && (teacher.avoidGap2 || teacher.avoidGap3)){
@@ -2934,26 +2942,89 @@ function autoGenerateAll(){
     let placedCount = 0;
     days.forEach(d=> Object.values(localSchedules[a.classId][d]).forEach(v=>{ if(v===a.id) placedCount++; }));
     let deficit = a.periodsPerWeek - placedCount;
-    while(deficit>0){
-      let placedOne = false;
-      for(const day of shuffle(days)){
-        if(isTeacherBlocked(a.teacherId, day, null)) continue;
-        for(let p=0;p<periods;p++){
-          if(localSchedules[a.classId][day][p]) continue;
-          const key = day+'|'+p;
-          if(teacherOccupied[a.teacherId] && teacherOccupied[a.teacherId].has(key)) continue;
-          if(isTeacherBlocked(a.teacherId, day, p)) continue;
-          place({assignment:a}, day, p);
-          placedOne = true;
-          break;
+    const cntOn = d=> Object.values(localSchedules[a.classId][d]).filter(v=>v===a.id).length;
+    for(const strict of [true,false]){
+      while(deficit>0){
+        let placedOne = false;
+        // days where this subject appears least come first (spreads lessons instead of stacking them)
+        const order = shuffle(days.slice()).sort((x,y)=>cntOn(x)-cntOn(y));
+        for(const day of order){
+          if(strict && cntOn(day) >= (a.maxPerDay||2)) continue;
+          if(isTeacherBlocked(a.teacherId, day, null)) continue;
+          for(let p=0;p<periods;p++){
+            if(localSchedules[a.classId][day][p]) continue;
+            const key = day+'|'+p;
+            if(teacherOccupied[a.teacherId] && teacherOccupied[a.teacherId].has(key)) continue;
+            if(isTeacherBlocked(a.teacherId, day, p)) continue;
+            place({assignment:a}, day, p);
+            placedOne = true;
+            break;
+          }
+          if(placedOne) break;
         }
-        if(placedOne) break;
+        if(!placedOne) break;
+        deficit--;
       }
-      if(!placedOne) break;
-      deficit--;
     }
     unplaced += deficit;
   });
+
+  // Repair pass: if a subject is stacked twice on one day while it should use more days,
+  // swap that lesson with a lesson on an unused day when both teachers are free.
+  (function repairSpread(){
+    const aMap = {}; config.assignments.forEach(x=> aMap[x.id]=x);
+    const cnt = (cid,d,id)=> Object.values(localSchedules[cid][d]).filter(v=>v===id).length;
+    const tFree = (t,d,pp)=> !(teacherOccupied[t] && teacherOccupied[t].has(d+'|'+pp)) && !isTeacherBlocked(t,d,pp);
+    for(let round=0; round<4; round++){
+      let changed = false;
+      config.assignments.forEach(a=>{
+        const cid = a.classId, want = Math.min(a.daysPerWeek||days.length, a.periodsPerWeek);
+        let guard = 0;
+        while(guard++ < 6){
+          const used = days.filter(d=>cnt(cid,d,a.id)>0).length;
+          if(used >= want) break;
+          const X = days.find(d=>cnt(cid,d,a.id)>=2);
+          if(!X) break;
+          let done = false;
+          for(const Y of days){
+            if(done) break;
+            if(cnt(cid,Y,a.id)>0) continue;
+            for(let pp=0; pp<periods && !done; pp++){
+              if(localSchedules[cid][X][pp]!==a.id) continue;
+              for(let q=0; q<periods && !done; q++){
+                const bid = localSchedules[cid][Y][q] || null;
+                const b = bid ? aMap[bid] : null;
+                if(!tFree(a.teacherId, Y, q)) continue;
+                if(b){
+                  // b moves Y,q -> X,pp
+                  if(!(teacherOccupied[b.teacherId] && teacherOccupied[b.teacherId].has(X+'|'+pp)) && !isTeacherBlocked(b.teacherId,X,pp)){}
+                  else continue;
+                  if(cnt(cid,X,b.id) >= (b.maxPerDay||2)) continue;
+                  if(cnt(cid,X,b.id) >= 1) continue; // don't create a new double for b
+                }
+                // apply
+                teacherOccupied[a.teacherId].delete(X+'|'+pp);
+                teacherOccupied[a.teacherId].add(Y+'|'+q);
+                if(b){
+                  teacherOccupied[b.teacherId].delete(Y+'|'+q);
+                  teacherOccupied[b.teacherId].add(X+'|'+pp);
+                }
+                localSchedules[cid][Y][q] = a.id;
+                localSchedules[cid][X][pp] = b ? b.id : null;
+                const csd = classSubjectDayCount[cid];
+                csd[X][a.subjectId]--; csd[Y][a.subjectId] = (csd[Y][a.subjectId]||0)+1;
+                if(b){ csd[Y][b.subjectId]--; csd[X][b.subjectId] = (csd[X][b.subjectId]||0)+1; }
+                else { classDayTotal[cid][X]--; classDayTotal[cid][Y]++; }
+                done = true; changed = true;
+              }
+            }
+          }
+          if(!done) break;
+        }
+      });
+      if(!changed) break;
+    }
+  })();
 
   schedules = localSchedules;
   balanceClassDays();
