@@ -2786,13 +2786,25 @@ function sendTeacherWhatsapp(){
      whatever was placed so far is kept and the remainder is filled in
      with a best-effort pass, same as before.
 ---------------------------------------------------------------------- */
-function autoGenerateAll(){
+let GEN_CAP = {};
+function autoGenerateAll(relax, attempt){
+  attempt = attempt||0;
   if(config.assignments.length===0){
     showAlert('سەرەتا لە خشتەی «دابەشکردن» وانەکان دابەش بکە.');
     return;
   }
   const days = config.settings.days;
   const periods = config.settings.periodsPerDay;
+  // Strict rule first: a subject only repeats on the same day when it has more lessons than available days.
+  // (Only if that cannot be satisfied does the generator fall back to the user's own زۆرترین لە ڕۆژێکدا.)
+  GEN_CAP = {};
+  config.assignments.forEach(a=>{
+    const userMax = a.maxPerDay||2;
+    if(relax){ GEN_CAP[a.id] = userMax; return; }
+    const elig = days.filter(d=>!isTeacherBlocked(a.teacherId, d, null)).length || days.length;
+    const nd = Math.max(1, Math.min(a.daysPerWeek||days.length, elig));
+    GEN_CAP[a.id] = Math.min(userMax, Math.max(a.minPerDay||1, Math.ceil(a.periodsPerWeek/nd)));
+  });
   const subjMap = {}; config.subjects.forEach(s=> subjMap[s.id]=s);
   const teacherMap = {}; config.teachers.forEach(t=> teacherMap[t.id]=t);
 
@@ -2828,7 +2840,7 @@ function autoGenerateAll(){
     for(const day of days){
       if(isTeacherBlocked(a.teacherId, day, null)) continue;
       const dayCount = (classSubjectDayCount[a.classId][day]||{})[a.subjectId] || 0;
-      if(dayCount >= (a.maxPerDay||2)) continue;
+      if(dayCount >= (GEN_CAP[a.id]||a.maxPerDay||2)) continue;
       for(let p=0;p<periods;p++){
         if(localSchedules[a.classId][day][p]) continue;
         const key = day+'|'+p;
@@ -2899,7 +2911,7 @@ function autoGenerateAll(){
 
   let steps = 0;
   const MAX_STEPS = 150000;
-  const DEADLINE = Date.now() + 3500; // hard time limit so the page never freezes
+  const DEADLINE = Date.now() + (relax ? 3000 : 450); // hard time limit so the page never freezes
   let aborted = false;
 
   function backtrack(remaining){
@@ -2943,13 +2955,13 @@ function autoGenerateAll(){
     days.forEach(d=> Object.values(localSchedules[a.classId][d]).forEach(v=>{ if(v===a.id) placedCount++; }));
     let deficit = a.periodsPerWeek - placedCount;
     const cntOn = d=> Object.values(localSchedules[a.classId][d]).filter(v=>v===a.id).length;
-    for(const strict of [true,false]){
+    for(const strict of (relax ? [true,false] : [true])){
       while(deficit>0){
         let placedOne = false;
         // days where this subject appears least come first (spreads lessons instead of stacking them)
         const order = shuffle(days.slice()).sort((x,y)=>cntOn(x)-cntOn(y));
         for(const day of order){
-          if(strict && cntOn(day) >= (a.maxPerDay||2)) continue;
+          if(strict && cntOn(day) >= (GEN_CAP[a.id]||a.maxPerDay||2)) continue;
           if(isTeacherBlocked(a.teacherId, day, null)) continue;
           for(let p=0;p<periods;p++){
             if(localSchedules[a.classId][day][p]) continue;
@@ -2968,6 +2980,8 @@ function autoGenerateAll(){
     }
     unplaced += deficit;
   });
+
+  if(!relax && unplaced>0){ return autoGenerateAll(attempt<7 ? false : true, attempt+1); }
 
   // Repair pass: if a subject is stacked twice on one day while it should use more days,
   // swap that lesson with a lesson on an unused day when both teachers are free.
@@ -2999,7 +3013,7 @@ function autoGenerateAll(){
                   // b moves Y,q -> X,pp
                   if(!(teacherOccupied[b.teacherId] && teacherOccupied[b.teacherId].has(X+'|'+pp)) && !isTeacherBlocked(b.teacherId,X,pp)){}
                   else continue;
-                  if(cnt(cid,X,b.id) >= (b.maxPerDay||2)) continue;
+                  if(cnt(cid,X,b.id) >= (GEN_CAP[b.id]||b.maxPerDay||2)) continue;
                   if(cnt(cid,X,b.id) >= 1) continue; // don't create a new double for b
                 }
                 // apply
@@ -3073,7 +3087,7 @@ function balanceClassDays(){
           if(isTeacherBlocked(a.teacherId, minDay, p2)) continue;
           if(findTeacherConflict(a.teacherId, minDay, p2, cls.id)) continue;
           const sameSubjCount = Object.keys(grid[minDay]).filter(k=>grid[minDay][k]===aid).length;
-          if(sameSubjCount >= (a.maxPerDay||2)) continue;
+          if(sameSubjCount >= (GEN_CAP[a.id]||a.maxPerDay||2)) continue;
           grid[minDay][p2] = aid;
           grid[maxDay][p] = null;
           moved = true;
